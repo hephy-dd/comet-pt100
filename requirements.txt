@@ -1,0 +1,1 @@
+comet @ https://github.com/hephy-dd/comet/archive/ui.zip#egg=comet-0.3.0
