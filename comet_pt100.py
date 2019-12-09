@@ -28,10 +28,10 @@ class MeasureProcess(comet.Process, ResourceMixin):
         with ITC(self.resources.get("cts")) as cts, \
              K2700(self.resources.get("multi")) as multi:
             # CTS ON
-            cts.query_bytes("s1 1", 4)
+            cts.query_bytes("s1 1", 2)
             self.measure(cts, multi)
             # CTS OFF
-            cts.query_bytes("s1 0", 4)
+            cts.query_bytes("s1 0", 2)
 
     def read(self, cts, multi):
         # Get CTS
@@ -61,10 +61,12 @@ class MeasureProcess(comet.Process, ResourceMixin):
                 step_temp = -step_temp
             # Ramp
             for target_temp in comet.Range(current_temp, end_temp, step_temp):
-                cts.setAnalogChannel(1, target_temp)
+                # cts.setAnalogChannel(1, target_temp) # BUG
+                cts.query_bytes("a{} {:05.1f}".format(0, target_temp), 1)
                 # Wait until target temperature reached
                 while not target_temp - self.offset < current_temp < target_temp + self.offset:
                     logging.info("target: {}, current: {}".format(target_temp, current_temp))
+                    reading = self.read(cts, multi)
                     current_temp = reading.get('temp')[1]
                     # Exit on stop request
                     if self.stopRequested():
@@ -121,9 +123,10 @@ def main():
     app.title = "Pt100"
 
     # Resources
+    resources = QtCore.QSettings().value('resources', {})
     app.resources.update({
-        "cts": "TCPIP::127.0.0.1::1080::SOCKET",
-        "multi": "TCPIP::127.0.0.1::10001::SOCKET"
+        "cts": resources.get("cts", "TCPIP::127.0.0.1::1080::SOCKET"),
+        "multi": resources.get("multi", "TCPIP::127.0.0.1::10001::SOCKET")
     })
 
     # Processes
