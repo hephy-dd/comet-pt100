@@ -71,6 +71,7 @@ class MeasureProcess(comet.Process, ResourceMixin):
         with ITC(cts_resource) as cts, K2700(multi_resource) as multi:
             cts.start()
             self.measure(cts, multi)
+            self.hideProgress()
             cts.stop()
 
     def read(self, cts, multi):
@@ -105,40 +106,35 @@ class MeasureProcess(comet.Process, ResourceMixin):
 
         # Loop over temperature ramps
         for i, ramp in enumerate(ramps):
+            self.showProgress(i + 1, len(ramps))
             current_temp = reading.get('temp')[1]
             end_temp = ramp.get('end')
-            step_temp = ramp.get('step')
-            if end_temp < current_temp:
-                step_temp = -step_temp
-            # Ramp to end temperature
-            for target_temp in comet.Range(current_temp, end_temp, step_temp):
-                cts.setAnalogChannel(1, target_temp)
-                # Wait until target temperature reached
-                while not (target_temp - self.offset) <= current_temp <= (target_temp + self.offset):
-                    self.messageChanged.emit("Ramp {}/{}, ramping to {} degC...".format(i, len(ramps), target_temp))
-                    logging.info("target: {}+-{}, current: {}".format(target_temp, self.offset, current_temp))
-                    reading = self.read(cts, multi)
-                    current_temp = reading.get('temp')[1]
-                    # Exit on stop request
-                    if self.stopRequested():
-                        return
-                    time.sleep(self.poll_interval)
-                # Wait until interval elapsed
-                time_end = time.time() + ramp.get('interval') * 60
-                while time.time() < time_end:
-                    self.messageChanged.emit("Ramp {}/{}, waiting...".format(i, len(ramps)))
-                    self.read(cts, multi)
-                    # Exit on stop request
-                    if self.stopRequested():
-                        return
-                    time.sleep(self.poll_interval)
+            cts.setAnalogChannel(1, end_temp)
+            # Wait until target temperature reached
+            while not (end_temp - self.offset) <= current_temp <= (end_temp + self.offset):
+                self.showMessage("Target temp. {} degC...".format(end_temp))
+                logging.info("target: {}+-{}, current: {}".format(end_temp, self.offset, current_temp))
+                reading = self.read(cts, multi)
+                current_temp = reading.get('temp')[1]
+                # Exit on stop request
+                if self.stopRequested():
+                    return
+                time.sleep(self.poll_interval)
+            # Wait until interval elapsed
+            time_end = time.time() + ramp.get('interval') * 60
+            while time.time() < time_end:
+                self.showMessage("Waiting...")
+                self.read(cts, multi)
+                # Exit on stop request
+                if self.stopRequested():
+                    return
+                time.sleep(self.poll_interval)
 
 def on_add_ramp(event):
     """Add ramp to table."""
     end = comet.get("ramp_end").value
-    step = comet.get("ramp_step").value
     interval = comet.get("ramp_interval").value
-    comet.get("table").append(end=end, step=step, interval=interval)
+    comet.get("table").append(end=end, interval=interval)
 
 def on_clear_ramps(event):
     """Clear ramp table."""
@@ -158,10 +154,6 @@ def on_finished():
     comet.get("stop").enabled = False
     comet.get("add_ramp_fs").enabled = True
     comet.get("ramps_fs").enabled = True
-
-def on_failed(exception):
-    """On measurement failed."""
-    comet.get("root").qt.showException(exception)
 
 def on_update(data):
     """On measurement reading."""
@@ -185,9 +177,10 @@ def main():
     measure = MeasureProcess()
     measure.started.connect(on_started)
     measure.finished.connect(on_finished)
-    measure.failed.connect(on_failed)
     measure.reading.connect(on_update)
     app.processes().add("measure", measure)
+    # Connect process with main window (tweak)
+    app.get('root').qt.connectProcess(measure)
 
     # Layout
     app.layout = comet.Row(
@@ -201,14 +194,12 @@ def main():
             ),
             comet.FieldSet(
                 id="add_ramp_fs",
-                title="Add Temp. Ramp",
+                title="Add Temperature",
                 layout=comet.Column(
                     comet.Label(text="Target Temp."),
                     comet.Number(id="ramp_end", value=25, minimum=-40, maximum=120, unit="°C"),
-                    comet.Label(text="Step"),
-                    comet.Number(id="ramp_step", value=5, maximum=25, unit="°C"),
                     comet.Label(text="Duration"),
-                    comet.Number(id="ramp_interval", value=1, maximum=60, precision=1, unit="min"),
+                    comet.Number(id="ramp_interval", value=1, maximum=3600, precision=1, unit="min"),
                     comet.Button(title="Add", click=on_add_ramp)
                 )
             ),
@@ -218,8 +209,8 @@ def main():
                 layout=comet.Column(
                     comet.Table(
                         id="table",
-                        columns=["end", "step", "interval"],
-                        titles=dict(end="Target °C", step="Step in °C", interval="Dur. min")
+                        columns=["end", "interval"],
+                        titles=dict(end="Target °C", interval="Dur. min")
                     ),
                     comet.Button(title="Clear", click=on_clear_ramps)
                 )
