@@ -5,7 +5,12 @@ Keitley 2700 multimeter using a Pt100 temperature sensor.
 
 """
 import time
+import datetime
 import logging
+import csv
+import re
+import os
+
 from PyQt5 import QtCore
 
 import comet
@@ -13,6 +18,41 @@ from comet.mixins import ResourceMixin
 
 from comet.devices.cts import ITC
 from comet.devices.keithley import K2700
+
+def iso_datetime():
+    """Returns filesystem safe ISO date time."""
+    return datetime.datetime.now().replace(microsecond=0).isoformat().replace(':', '-')
+
+class ITC(ITC):
+    """Extended ITC device."""
+
+    def start(self):
+        """Switch climate chamber ON."""
+        result = self.query_bytes("s1 1", 2)
+        if result != "s1":
+            raise RuntimeError("Failed to start")
+
+    def stop(self):
+        """Switch climate chamber OFF."""
+        result = self.query_bytes("s1 0", 2)
+        if result != "s1":
+            raise RuntimeError("Failed to stop")
+
+class K2700(K2700):
+    """Extended K2700 device."""
+
+    def fetch(self):
+        """Returns the latest available readings as list of dictionaries.
+        .. note:: It does not perform a measurement.
+        >>> device.fetch()
+        [{'VDC': -4.32962079e-05, 'SECS': 0.0, 'RDNG': 0.0}, ...]
+        """
+        results = []
+        # split '-4.32962079E-05VDC,+0.000SECS,+0.0000RDNG#,...' into list of dicts
+        for values in re.findall(r'([^#]+)#\,?', self.resource().query('FETC?')):
+            values = re.findall(r'([+-]?\d+(?:\.\d+)?(?:[eE][+-]\d+)?)([_A-Z]+)\,?', values)
+            results.append({suffix: float(value) for value, suffix in values})
+        return results
 
 class MeasureProcess(comet.Process, ResourceMixin):
     """Measurement process."""
@@ -22,50 +62,61 @@ class MeasureProcess(comet.Process, ResourceMixin):
 
     poll_interval = 10
 
-    offset = .5
+    offset = .1
 
     def run(self):
-        with ITC(self.resources.get("cts")) as cts, \
-             K2700(self.resources.get("multi")) as multi:
-            # CTS ON
-            cts.query_bytes("s1 1", 2)
+        self.filename = os.path.join(os.path.expanduser('~'), 'pt100-{}.csv'.format(iso_datetime()))
+        cts_resource = self.resources.get("cts")
+        multi_resource = self.resources.get("multi")
+        with ITC(cts_resource) as cts, K2700(multi_resource) as multi:
+            cts.start()
             self.measure(cts, multi)
-            # CTS OFF
-            cts.query_bytes("s1 0", 2)
+            cts.stop()
 
     def read(self, cts, multi):
         # Get CTS
         t = time.time()
-        temp = (t, cts.analogChannel(1)[0])
-        humid = (t, cts.analogChannel(2)[0])
+        temp = cts.analogChannel(1)[0]
+        humid =cts.analogChannel(2)[0]
         # Measure
         multi.init()
-        pt100 = (t, multi.fetch()[0].get('_C', -100))
+        pt100 = multi.fetch()[0].get('_C', 0)
+        logging.info('K2700: %s degC', pt100)
         reading = dict(
-            temp=temp,
-            humid=humid,
-            pt100=pt100
+            temp=(t, temp),
+            humid=(t, humid),
+            pt100=(t, pt100)
         )
         self.reading.emit(reading)
+        with open(self.filename, 'a', newline='') as fp:
+            writer = csv.writer(fp)
+            writer.writerow([t, temp, humid, pt100])
         return reading
 
     def measure(self, cts, multi):
+        # Setup CSV dump
+        with open(self.filename, 'a', newline='') as fp:
+            writer = csv.writer(fp)
+            writer.writerow('time cts_temp cts_humid pt100'.split())
+
+        # Initial reading
         reading = self.read(cts, multi)
         ramps = comet.get("table").data
+
         # Loop over temperature ramps
-        for ramp in ramps:
+        for i, ramp in enumerate(ramps):
             current_temp = reading.get('temp')[1]
             end_temp = ramp.get('end')
             step_temp = ramp.get('step')
             if end_temp < current_temp:
                 step_temp = -step_temp
-            # Ramp
+            # Ramp to end temperature
             for target_temp in comet.Range(current_temp, end_temp, step_temp):
-                # cts.setAnalogChannel(1, target_temp) # BUG
-                cts.query_bytes("a{} {:05.1f}".format(0, target_temp), 1)
+                cts.setAnalogChannel(1, target_temp)
                 # Wait until target temperature reached
-                while not target_temp - self.offset < current_temp < target_temp + self.offset:
-                    logging.info("target: {}, current: {}".format(target_temp, current_temp))
+                while not (target_temp - self.offset) <= current_temp <= (target_temp + self.offset):
+                    self.messageChanged.emit("Ramp {}/{}, ramping to {} degC...".format(i, len(ramps), target_temp))
+                    logging.info("target: {}+-{}, current: {}".format(target_temp, self.offset, current_temp))
                     reading = self.read(cts, multi)
                     current_temp = reading.get('temp')[1]
                     # Exit on stop request
@@ -73,8 +124,9 @@ class MeasureProcess(comet.Process, ResourceMixin):
                         return
                     time.sleep(self.poll_interval)
                 # Wait until interval elapsed
-                time_end = time.time() + ramp.get('interval')
+                time_end = time.time() + ramp.get('interval') * 60
                 while time.time() < time_end:
+                    self.messageChanged.emit("Ramp {}/{}, waiting...".format(i, len(ramps)))
                     self.read(cts, multi)
                     # Exit on stop request
                     if self.stopRequested():
